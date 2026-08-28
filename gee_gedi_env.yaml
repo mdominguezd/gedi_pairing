@@ -1,0 +1,53 @@
+# env_gee.yaml — conda env for the GEE-based GEDI pairing API
+# create:  mamba env create -f env_gee.yaml
+# NOTE: your own modules are NOT installed by this file. After creating the env,
+#   make chap1_modules / geedal_utils / geedal_utils_on_steroids / pairing_algorithms
+#   importable (add their folder to PYTHONPATH, or `pip install -e .` if packaged).
+name: gee_gedi
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+
+  # --- Earth Engine + geemap (the packages that drive this env) ---
+  - earthengine-api>=1.7
+  - geemap>=0.35
+  - google-auth
+  - google-auth-oauthlib
+  - google-api-python-client
+
+  # --- compiled geospatial core (conda so binaries agree) ---
+  - gdal
+  - geopandas>=1.1
+  - shapely>=2.0
+  - pyproj>=3.6
+  - rasterio>=1.4
+  - rioxarray
+
+  # --- array / compute ---
+  - numpy>=2.0
+  - pandas>=2.2
+  - scipy>=1.13
+  - scikit-learn>=1.4        # StandardScaler / scale_features
+  - xarray>=2024.9
+  - dask>=2024.8             # pairing imports dask; get_close_fs_pairs uses joblib
+  - joblib>=1.4
+  - tiledb-py>=0.32          # gedidb backend
+  - pyarrow                  # parquet (your ref_gdf)
+
+  # --- API ---
+  - fastapi
+  - uvicorn
+  - pydantic>=2
+
+  # --- misc runtime used across your modules ---
+  - tqdm
+  - requests
+  - matplotlib
+  - contextily               # for the plotting/analysis you were doing
+
+  # --- pip overlay: not reliably on conda-forge ---
+  - pip
+  - pip:
+      - gedidb[io]           # GEDI S3 access (+ s3fs/boto3/fsspec)
+      # your own code is added separately — see NOTE at top
