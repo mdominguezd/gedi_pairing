@@ -43,7 +43,7 @@ def _to_gdf(geojson: dict) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(geometry=[shape(geojson)], crs="EPSG:4326")
 
 
-def _get_gedi(geojson, start_time, end_time, buffer_m=400, bbox=None,
+def _get_gedi(geojson, start_time, end_time, buffer_m=600, bbox=None,
               variables=("agbd", "rh:98")):
     """Pull GEDI shots via gedidb. If `bbox` (minx,miny,maxx,maxy in EPSG:4326)
     is given, query that box directly and skip the internal buffer."""
@@ -88,7 +88,7 @@ class PairRequest(BaseModel):
     img_start: str = "2018-01-01"          # imagery window for EE features
     img_end: str = "2019-01-01"
     gedi_start: str = "2019-04-01"
-    gedi_end: str | None = "2024-04-01"
+    gedi_end: str | None = None
     max_distance: float = 400
     weight_geo: float = 0.75
     crs: str = "EPSG:25830"
@@ -104,36 +104,36 @@ def disturbed_pairs(req: PairRequest):
     end = req.gedi_end or pd.Timestamp.now().strftime("%Y-%m-%d")
 
     aoi = _to_gdf(req.geojson)
+    # auto-select the local UTM CRS (metric) from the AOI location
+    crs = aoi.estimate_utm_crs().to_string()        # e.g. "EPSG:32630"
     bbox = tuple(aoi.total_bounds)                  # (minx, miny, maxx, maxy) in EPSG:4326
-    shots = _get_gedi(req.geojson, req.gedi_start, end, bbox=bbox)
-    
+
+    shots = _get_gedi(req.geojson, req.gedi_start, end)
     if shots is None or len(shots) < 2:
         return {"type": "FeatureCollection", "features": []}
 
-    # label + build the columns the pairing needs
     fire = pd.Timestamp(req.disturbance_date)
     shots["time"] = pd.to_datetime(shots["time"])
     shots["disturbed"] = shots["time"] > fire
-    shots["dist"] = fire                            # per-shot fire date (single event here)
+    shots["dist"] = fire
     shots["shot_num_2"] = shots["shot_number"].astype("uint64")
 
-    # query set = disturbed (post-fire) shots; candidate pool = ALL shots (feat_gdf)
     shots_2 = shots[shots["disturbed"]].copy().reset_index(drop=True)
     if len(shots_2) == 0:
         return {"type": "FeatureCollection", "features": []}
 
-    # PHASE 1 — extract EE features for EVERY shot ONCE (batched, not per-query)
     feat_gdf, feat_cols = pairing_algorithms_enhanced.precompute_features(
         shots, dates=[req.img_start, req.img_end],
         use_baseline=req.use_baseline, use_slope=req.use_slope,
         use_embeddings=req.use_embeddings,
     )
-    # PHASE 2 — match disturbed (post-fire) queries in memory, no EE in the loop
     paired = pairing_algorithms_enhanced.get_close_fs_pairs_fast(
         feat_gdf, feat_cols, shots_2=shots_2,
-        crs=req.crs, max_distance=req.max_distance, weight_geo=req.weight_geo,
+        crs=crs, max_distance=req.max_distance, weight_geo=req.weight_geo,
         disturbed=True, use_baseline=req.use_baseline, use_slope=req.use_slope,
     )
+
+    paired = paired.sjoin(aoi)
 
     # keep matched queries; serialize dict/list columns for GeoJSON
     paired = paired[paired["new_shot_num_1"].notna()].copy()
@@ -168,6 +168,8 @@ def landing():
  textarea{min-height:80px;font-family:monospace;font-size:.78rem}
  .row{display:flex;gap:.9rem;flex-wrap:wrap}.row>div{flex:1;min-width:130px}
  #map{height:320px;border-radius:10px;border:1px solid var(--line)}
+ #drop{border:2px dashed var(--line);border-radius:10px;padding:1.1rem;text-align:center;color:var(--mut);cursor:pointer;margin-bottom:.6rem;transition:.15s}
+ #drop.over{border-color:var(--acc);background:#12241b}
  .tabs{display:flex;gap:.4rem;margin:.5rem 0}.tab{padding:.35rem .8rem;border:1px solid var(--line);border-radius:999px;cursor:pointer;font-size:.8rem;color:var(--mut)}.tab.on{background:var(--acc);color:#fff;border-color:var(--acc)}
  button{margin-top:1rem;padding:.6rem 1.15rem;border:0;border-radius:9px;background:var(--acc);color:#fff;font-weight:600;cursor:pointer}
  button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
@@ -177,9 +179,14 @@ def landing():
 <h1>🔥 GEDI disturbed-pair finder (GEE)</h1>
 <div class="card">
   <label>Burned area</label>
-  <div class="tabs"><div class="tab on" data-t="map">Draw</div><div class="tab" data-t="paste">GeoJSON</div></div>
+  <div class="tabs"><div class="tab on" data-t="map">Draw</div><div class="tab" data-t="paste">Upload / paste</div></div>
   <div id="pane-map"><div id="map"></div></div>
-  <div id="pane-paste" class="hide"><textarea id="gjtext" placeholder='{"type":"Polygon",...}'></textarea></div>
+  <div id="pane-paste" class="hide">
+    <div id="drop">Drop a .geojson file here, or click to choose</div>
+    <input type="file" id="file" accept=".geojson,.json" class="hide">
+    <div id="fname" class="mut" style="margin-bottom:.4rem"></div>
+    <textarea id="gjtext" placeholder='…or paste GeoJSON here'></textarea>
+  </div>
   <div id="aoi-state" class="mut">No AOI set.</div>
 </div>
 <div class="card">
@@ -209,6 +216,33 @@ map.addControl(new L.Control.Draw({edit:{featureGroup:drawn},draw:{polygon:true,
 function setAOI(g,s){aoi=g;$('aoi-state').innerHTML='<span class="ok">✓ AOI set ('+s+')</span>';$('run').disabled=false;}
 map.on(L.Draw.Event.CREATED,e=>{drawn.clearLayers();drawn.addLayer(e.layer);setAOI(e.layer.toGeoJSON().geometry,'drawn');});
 $('gjtext').addEventListener('input',()=>{try{setAOI(JSON.parse($('gjtext').value),'geojson');}catch(e){}});
+
+// file picker + drag/drop
+const drop=$('drop'), file=$('file');
+drop.onclick=()=>file.click();
+['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over');}));
+['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over');}));
+drop.addEventListener('drop',ev=>readFile(ev.dataTransfer.files[0]));
+file.onchange=()=>readFile(file.files[0]);
+function readFile(f){
+  if(!f)return;
+  const r=new FileReader();
+  r.onload=()=>{
+    try{
+      const g=JSON.parse(r.result);
+      setAOI(g,'file: '+f.name);
+      $('gjtext').value=r.result;
+      $('fname').innerHTML='<span class="ok">✓ '+f.name+'</span>';
+      // auto-fill fire date from burn_date if present
+      let props=null;
+      if(g.type==='FeatureCollection'&&g.features&&g.features[0])props=g.features[0].properties;
+      else if(g.type==='Feature')props=g.properties;
+      if(props&&props.burn_date){$('disturbance_date').value=String(props.burn_date).slice(0,10);}
+    }catch(e){ $('fname').innerHTML='<span style="color:#e0a458">Invalid JSON: '+e+'</span>'; }
+  };
+  r.readAsText(f);
+}
+
 $('run').onclick=async()=>{
   if(!aoi)return;
   const body={geojson:aoi,disturbance_date:$('disturbance_date').value,

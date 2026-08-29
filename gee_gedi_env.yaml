@@ -33,7 +33,7 @@ dependencies:
   - dask>=2024.8             # pairing imports dask; get_close_fs_pairs uses joblib
   - joblib>=1.4
   - tiledb-py>=0.32          # gedidb backend
-  - pyarrow                  # parquet (your ref_gdf)
+  - pyarrow>=25                  # parquet (your ref_gdf)
 
   # --- API ---
   - fastapi
