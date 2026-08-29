@@ -23,6 +23,7 @@ dependencies:
   - pyproj>=3.6
   - rasterio>=1.4
   - rioxarray
+  - laspy
 
   # --- array / compute ---
   - numpy>=2.0
@@ -34,7 +35,6 @@ dependencies:
   - joblib>=1.4
   - tiledb-py>=0.32          # gedidb backend
   - pyarrow>=25                  # parquet (your ref_gdf)
-
   # --- API ---
   - fastapi
   - uvicorn

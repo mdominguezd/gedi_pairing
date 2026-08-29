@@ -30,18 +30,11 @@ For a burned-area AOI and disturbance date, the `/disturbed_pairs` endpoint:
 
 ### Python environment
 
-Create the environment from the provided file (see `env_gee.yaml`), or install:
-
-- Python 3.11
-- `earthengine-api`, `geemap`
-- `gedidb[io]`
-- `geopandas`, `shapely`, `pyproj`, `rioxarray`, `xarray`
-- `scikit-learn`, `numpy`, `pandas`, `scipy`
-- `fastapi`, `uvicorn`, `pydantic`
+Create the environment from the provided file (see `gee_gedi_env.yaml`):
 
 ```bash
-mamba env create -f env_gee.yaml
-mamba activate sengee
+mamba env create -f gee_gedi_env.yaml
+mamba activate gee_gedi
 ```
 
 ### Your own modules (NOT installed by the environment)
@@ -52,21 +45,9 @@ chapter-1 project and must be importable:
 - `chap1_modules.geedal.geedal_utils` — provides `earthengine_init()` and
   `scale_features()`
 - `chap1_modules.geedal.geedal_utils_on_steroids` — provides `extract_ee_values()`
-- `pairing_algorithms` — provides `precompute_features()` and
+- `chap1_modules.gedi_pairs` provides `pairing_algorithms_enhanced` and
+`pairing_algorithms` which provide `precompute_features()` and
   `get_close_fs_pairs_fast()`
-
-Make them importable in one of two ways:
-
-**Option A — install the chapter-1 package once (recommended):**
-```bash
-# from the folder that contains chap1_modules/ (needs __init__.py files)
-pip install -e .
-```
-
-**Option B — add the parent folder to PYTHONPATH before launching:**
-```bash
-export PYTHONPATH="/absolute/path/to/chapter-1:$PYTHONPATH"
-```
 
 Put `pairing_algorithms.py` next to `gee_main.py`, or on the same path.
 
