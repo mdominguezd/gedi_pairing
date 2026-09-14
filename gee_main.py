@@ -253,7 +253,7 @@ def disturbed_pairs(req: PairRequest):
         feat_gdf, feat_cols, shots_2=shots_2,
         crs=crs, max_distance=req.max_distance, weight_geo=req.weight_geo,
         disturbed=True, use_baseline=req.use_baseline, use_slope=req.use_slope,
-        all_feats = True
+        all_feats = False
     )
 
     paired = paired.sjoin(aoi)
@@ -407,7 +407,11 @@ $('run').onclick=async()=>{
   const t0=performance.now();
   try{
     const r=await fetch('/disturbed_pairs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const d=await r.json();last=d;
+    const txt=await r.text();
+    console.log('bytes received:', txt.length, '| Content-Length:', r.headers.get('content-length'));
+    if(!r.ok) throw new Error('HTTP '+r.status+': '+(txt.slice(0,500)||'(empty body)'));
+    if(!txt) throw new Error('empty response — server crashed or timed out (check uvicorn log)');
+    const d=JSON.parse(txt);last=d;
     const f=d.features||[];
     $('out').textContent='disturbed pairs: '+f.length+'   ·   '+((performance.now()-t0)/1000).toFixed(1)+'s';
     $('status').textContent='Done.';if(f.length)$('dl').classList.remove('hide');
