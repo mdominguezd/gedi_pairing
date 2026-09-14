@@ -265,6 +265,19 @@ def _ee_extraction_chunk(gdf_chunk, img_col, band_name, agg_fun, scale, dates,
 
     return gdf_chunk.drop(columns=['ee_id'])
 
+def _split_by_count(chunks, max_points=3000):
+    out = []
+    for c in chunks:
+        if len(c) <= max_points:
+            out.append(c)
+            continue
+        n = math.ceil(len(c) / max_points)
+        for k in range(n):
+            sub = c.iloc[k * max_points:(k + 1) * max_points].copy()
+            if len(sub):
+                out.append(sub)
+    return out
+
 
 def extract_ee_values(gdf, img_col, dates, band_name=None, agg_fun='mean', 
                       column_name='extracted_value', scale=10, slope=False, 
@@ -317,6 +330,8 @@ def extract_ee_values(gdf, img_col, dates, band_name=None, agg_fun='mean',
 
         # Create spatial chunks based on maximum extent size
         gdf_chunks = create_spatial_chunks(gdf, max_chunk_size=max_chunk_size)
+
+        gdf_chunks = _split_by_count(gdf_chunks, max_points=3000)
 
         # Add temporary column names for slope/aspect if needed
         if slope:

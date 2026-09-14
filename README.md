@@ -59,8 +59,10 @@ Put `pairing_algorithms.py` next to `gee_main.py`, or on the same path.
 `geedal_utils.earthengine_init()` runs on each request, but EE credentials must
 already exist in the server process. Authenticate once before serving:
 
-```bash
-earthengine authenticate          # interactive, or
+```python
+import ee
+
+ee.Authenticate(force = True) # interactive, or
 # configure a service account inside earthengine_init() for headless use
 ```
 

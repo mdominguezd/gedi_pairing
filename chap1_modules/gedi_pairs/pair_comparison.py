@@ -176,6 +176,15 @@ def calculate_wf_change_metrics(int_1, int_2, elev_1, elev_2):
 
     return change_integral, abs_change_integral, cos_sim, euc_dist, dtw, rmsd, r2, nrmsd, wass, ae_profile
 
+def _get_warc(int_1, int_2, elev_1, elev_2):
+
+    a_1 = np.trapezoid(int_1, elev_1)
+    a_2 = np.trapezoid(int_2, elev_2)
+
+    warc = (a_2 - a_1)/a_1
+    
+    return warc
+
 
 def plot_pair_selection(pair, ds):
 

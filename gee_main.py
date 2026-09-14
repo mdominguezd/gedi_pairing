@@ -13,6 +13,7 @@
 # (and your EE credentials / project) work before serving.
 
 import json
+import math
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -22,13 +23,14 @@ from shapely.geometry import shape
 import ee
 import gedidb as gdb
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # --- your uploaded modules (must be on PYTHONPATH) ---
 from chap1_modules.geedal import geedal_utils            # earthengine_init, scale_features
-from chap1_modules.gedi_pairs import pairing_algorithms_enhanced 
+from chap1_modules.gedi_pairs import pairing_algorithms_enhanced
 
 app = FastAPI(title="GEDI pairing (GEE)")
 
@@ -81,6 +83,118 @@ def _to_ds(shots_gdf, idx="shot_number"):
     return df.to_xarray()
 
 
+def _clean(v):
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    if isinstance(v, (np.floating,)):
+        f = float(v);  return None if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return [_clean(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _clean(x) for k, x in v.items()}
+    return v
+
+
+def gdf_to_geojson_str(gdf, geom_col="geometry"):
+    gdf = gdf.copy()
+    geom = gdf[geom_col]
+    props = gdf.drop(columns=[geom_col])
+
+    for c in props.select_dtypes(include=["datetime", "datetimetz"]).columns:
+        props[c] = props[c].astype(str)
+
+    # recursively clean every cell, including arrays-in-cells (pandas >=2.1 uses .map)
+    _mapper = props.map if hasattr(props, "map") else props.applymap
+    props = _mapper(_clean)
+
+    out = gpd.GeoDataFrame(props, geometry=geom, crs=gdf.crs)
+    # belt-and-suspenders: forbid NaN at the final encode so it fails loudly here,
+    # server-side, not as a cryptic SyntaxError on the client.
+    return json.dumps(json.loads(out.to_json()), allow_nan=False)
+
+
+def _list_cols(df, extra_skip=("geometry",)):
+    """Columns whose cells are arrays/lists (e.g. rh, cp_pavd)."""
+    skip = set(extra_skip)
+    out = []
+    for c in df.columns:
+        if c in skip:
+            continue
+        s = df[c].dropna()
+        if len(s) and isinstance(s.iloc[0], (list, tuple, np.ndarray)):
+            out.append(c)
+    return out
+
+
+def _add_metric_deltas(paired, shots, id1, id2, id_col="shot_number", skip_cols=()):
+    """Add d_<metric> = shot_2 - shot_1 for each SCALAR numeric GEDI metric.
+    `paired[id1]` = shot_1 (matched/pre) ids, `paired[id2]` = shot_2 (query/post) ids."""
+    sid = shots.copy()
+    sid["_sid"] = sid[id_col].astype(str)
+    drop = {id_col, "_sid", "longitude", "latitude", "time", "disturbed",
+            "dist", "shot_num_2", "geometry"} | set(skip_cols)
+    metric_cols = [c for c in sid.columns
+                   if c not in drop and pd.api.types.is_numeric_dtype(sid[c])]
+    if not metric_cols:
+        return paired
+
+    m = sid.set_index("_sid")[metric_cols]
+    a = m.reindex(paired[id1].astype(str)).reset_index(drop=True)   # shot_1 (pre)
+    b = m.reindex(paired[id2].astype(str)).reset_index(drop=True)   # shot_2 (post)
+
+    for c in metric_cols:
+        d = b[c].values - a[c].values
+        paired[f"d_{c}"] = np.where(np.isinf(d), np.nan, d)         # post - pre
+    return paired
+
+
+def _add_list_metric_deltas(paired, shots, list_cols, id1, id2,
+                            id_col="shot_number", keep_profiles=True):
+    """For each LIST-valued metric (rh, cp_pavd, …) add an elementwise change:
+        d_<metric>[i] = post[i] - pre[i]   (as a list, one per row).
+    Length is taken from the data (min of pre/post), so it works for rh (101),
+    cp_pavd (~30 bins), or any profile without hardcoding a length.
+    NaN in any bin is preserved and later serialized as null by _clean.
+    Optionally also attaches pre_<metric> / post_<metric> for reconstruction."""
+    if not list_cols:
+        return paired
+
+    sid = shots[[id_col] + list_cols].copy()
+    sid["_sid"] = sid[id_col].astype(str)
+    lut = sid.set_index("_sid")
+
+    pre_ids = paired[id1].astype(str).tolist()   # shot_1 (pre)
+    post_ids = paired[id2].astype(str).tolist()  # shot_2 (post)
+
+    def _arr(x):
+        if x is None:
+            return None
+        a = np.asarray(x, dtype="float64")
+        return a if a.ndim == 1 and a.size else None
+
+    for c in list_cols:
+        col = lut[c]
+        d_out, pre_out, post_out = [], [], []
+        for pid, qid in zip(pre_ids, post_ids):
+            pre = _arr(col.get(pid))
+            post = _arr(col.get(qid))
+            if pre is None or post is None:
+                d_out.append(None); pre_out.append(None); post_out.append(None)
+                continue
+            n = min(len(pre), len(post))          # align ragged profiles
+            pre, post = pre[:n], post[:n]
+            d_out.append((post - pre).tolist())   # NaN kept -> null via _clean
+            pre_out.append(pre.tolist())
+            post_out.append(post.tolist())
+        paired[f"d_{c}"] = d_out
+        if keep_profiles:
+            paired[f"pre_{c}"] = pre_out
+            paired[f"post_{c}"] = post_out
+    return paired
+
+
 # ─────────────────────────── API ───────────────────────────
 class PairRequest(BaseModel):
     geojson: dict                          # burned-area polygon
@@ -96,6 +210,7 @@ class PairRequest(BaseModel):
     use_slope: bool = True
     use_embeddings: bool = False
     n_jobs: int = 1
+    variables: list[str] | None = None     # GEDI metrics to fetch & difference
 
 
 @app.post("/disturbed_pairs")
@@ -108,7 +223,11 @@ def disturbed_pairs(req: PairRequest):
     crs = aoi.estimate_utm_crs().to_string()        # e.g. "EPSG:32630"
     bbox = tuple(aoi.total_bounds)                  # (minx, miny, maxx, maxy) in EPSG:4326
 
-    shots = _get_gedi(req.geojson, req.gedi_start, end)
+    variables = tuple(req.variables) if req.variables else ("agbd", "cp_pavd")
+
+    shots = _get_gedi(req.geojson, req.gedi_start, end, variables=variables)
+
+    # guard FIRST — must precede any shots.columns access
     if shots is None or len(shots) < 2:
         return {"type": "FeatureCollection", "features": []}
 
@@ -117,6 +236,9 @@ def disturbed_pairs(req: PairRequest):
     shots["disturbed"] = shots["time"] > fire
     shots["dist"] = fire
     shots["shot_num_2"] = shots["shot_number"].astype("uint64")
+
+    # list-valued metrics present in this pull (rh, cp_pavd, …)
+    list_metrics = _list_cols(shots)
 
     shots_2 = shots[shots["disturbed"]].copy().reset_index(drop=True)
     if len(shots_2) == 0:
@@ -131,24 +253,44 @@ def disturbed_pairs(req: PairRequest):
         feat_gdf, feat_cols, shots_2=shots_2,
         crs=crs, max_distance=req.max_distance, weight_geo=req.weight_geo,
         disturbed=True, use_baseline=req.use_baseline, use_slope=req.use_slope,
+        all_feats = True
     )
 
     paired = paired.sjoin(aoi)
 
-    # keep matched queries; serialize dict/list columns for GeoJSON
+    # keep matched queries only
     paired = paired[paired["new_shot_num_1"].notna()].copy()
     if len(paired) == 0:
         return {"type": "FeatureCollection", "features": []}
+
+    # scalar deltas (agbd, …), then elementwise deltas for list metrics (rh / cp_pavd)
+    paired = _add_metric_deltas(paired, shots, "new_shot_num_1", "shot_number",
+                                skip_cols=list_metrics)
+    paired = _add_list_metric_deltas(paired, shots, list_metrics,
+                                     "new_shot_num_1", "shot_number")
+
+    # lon/lat of shot 1 (matched/pre shot), looked up by id -> lon_1 / lat_1
+    _ll = shots.copy()
+    _ll["_sid"] = _ll["shot_number"].astype(str)
+    _ll = _ll.set_index("_sid")[["longitude", "latitude"]]
+    _m = _ll.reindex(paired["new_shot_num_1"].astype(str)).reset_index(drop=True)
+    paired["lon_1"] = _m["longitude"].values
+    paired["lat_1"] = _m["latitude"].values
+
+    # stringify any nested structured columns your pipeline attaches
     for c in ["possible_pairs", "s2_feats", "s1_feats", "all_pos_feats"]:
         if c in paired.columns:
-            paired[c] = paired[c].apply(lambda v: json.dumps(v, default=str) if v is not None else None)
+            paired[c] = paired[c].apply(
+                lambda v: json.dumps(v, default=str) if v is not None else None)
     for c in paired.columns:
         if pd.api.types.is_datetime64_any_dtype(paired[c]):
             paired[c] = paired[c].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
     paired["new_shot_num_1"] = paired["new_shot_num_1"].astype(str)
     if "shot_number" in paired.columns:
         paired["shot_number"] = paired["shot_number"].astype(str)
-    return json.loads(paired.to_json())
+
+    return Response(gdf_to_geojson_str(paired), media_type="application/json")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -164,7 +306,8 @@ def landing():
  .wrap{max-width:820px;margin:0 auto;padding:1.5rem 1rem 3rem}h1{font-size:1.3rem}
  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.1rem;margin-bottom:1rem}
  label{display:block;margin:.5rem 0 .2rem;font-size:.8rem;font-weight:600;color:var(--mut)}
- input,textarea{width:100%;padding:.5rem;border:1px solid var(--line);border-radius:8px;background:#0d141c;color:var(--ink)}
+ input,textarea,select{width:100%;padding:.5rem;border:1px solid var(--line);border-radius:8px;background:#0d141c;color:var(--ink)}
+ select[multiple]{padding:.3rem}select[multiple] option{padding:.25rem .35rem}
  textarea{min-height:80px;font-family:monospace;font-size:.78rem}
  .row{display:flex;gap:.9rem;flex-wrap:wrap}.row>div{flex:1;min-width:130px}
  #map{height:320px;border-radius:10px;border:1px solid var(--line)}
@@ -199,6 +342,16 @@ def landing():
     <div><label>Max distance (m)</label><input id="max_distance" type="number" value="400"></div>
     <div><label>weight_geo</label><input id="weight_geo" type="number" step="0.05" value="0.75"></div>
   </div>
+  <label>GEDI variables</label>
+  <select id="variables" multiple size="6">
+    <option value="agbd" selected>agbd — aboveground biomass density</option>
+    <option value="cp_pavd" selected>cp_pavd — PAVD profile (list)</option>
+    <option value="rh">rh — relative-height profile (list)</option>
+    <option value="cover">cover — canopy cover</option>
+    <option value="fhd_normal">fhd_normal — foliage height diversity</option>
+    <option value="pai">pai — plant area index</option>
+  </select>
+  <div class="mut" style="margin-top:.3rem">Ctrl/Cmd-click to select multiple. Leave none for the default (agbd + cp_pavd).</div>
   <button id="run" disabled>Find disturbed pairs</button>
   <button id="dl" class="ghost hide">⬇ Download GeoJSON</button>
   <span id="status" class="mut"></span>
@@ -247,7 +400,8 @@ $('run').onclick=async()=>{
   if(!aoi)return;
   const body={geojson:aoi,disturbance_date:$('disturbance_date').value,
     img_start:$('img_start').value,img_end:$('img_end').value,
-    max_distance:parseFloat($('max_distance').value),weight_geo:parseFloat($('weight_geo').value)};
+    max_distance:parseFloat($('max_distance').value),weight_geo:parseFloat($('weight_geo').value),
+    variables:[...$('variables').selectedOptions].map(o=>o.value)};
   $('run').disabled=true;$('dl').classList.add('hide');$('out').classList.remove('hide');
   $('status').textContent='Running EE extraction… (can take minutes)';$('out').textContent='';
   const t0=performance.now();
